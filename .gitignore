@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Test artifacts
+.pytest_cache/
