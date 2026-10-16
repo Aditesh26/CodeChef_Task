@@ -1,0 +1,177 @@
+"""Atomic reservation checkout with a deterministic payment simulator."""
+
+from datetime import UTC, datetime
+from decimal import Decimal
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Response, status
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from codechef_task.database import get_db_session
+from codechef_task.models import (
+    Booking,
+    BookingStatus,
+    Event,
+    Payment,
+    PaymentStatus,
+    Reservation,
+    ReservationStatus,
+    Seat,
+)
+from codechef_task.reservation_routes import (
+    _expire_if_elapsed,
+    _read_reservation_location,
+)
+
+router = APIRouter()
+
+
+class CheckoutRequest(BaseModel):
+    """Select a simulated gateway result; price always comes from the event."""
+
+    outcome: Literal["success", "failure"]
+
+
+class CheckoutRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    booking_id: int
+    reservation_id: int
+    booking_status: BookingStatus
+    payment_id: int
+    payment_status: PaymentStatus
+    amount: Decimal
+    currency: str
+
+
+def _checkout_response(booking: Booking, payment: Payment) -> CheckoutRead:
+    return CheckoutRead(
+        booking_id=booking.id,
+        reservation_id=booking.reservation_id,
+        booking_status=booking.status,
+        payment_id=payment.id,
+        payment_status=payment.status,
+        amount=payment.amount,
+        currency=payment.currency,
+    )
+
+
+@router.post(
+    "/api/reservations/{reservation_id}/checkout",
+    response_model=CheckoutRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def checkout_reservation(
+    payload: CheckoutRequest,
+    response: Response,
+    reservation_id: int = Path(gt=0),
+    session: AsyncSession = Depends(get_db_session),
+) -> CheckoutRead:
+    """Convert an active hold and record one simulated payment atomically."""
+    event_id, seat_id = await _read_reservation_location(session, reservation_id)
+    result: CheckoutRead | None = None
+    conflict: str | None = None
+    replayed = False
+
+    try:
+        async with session.begin():
+            # Share the reservation lifecycle's seat-first lock order. The seat
+            # is the mutex for checkout, cancellation, expiry, and new holds.
+            seat = await session.scalar(
+                select(Seat)
+                .where(Seat.event_id == event_id, Seat.id == seat_id)
+                .with_for_update()
+            )
+            if seat is None:
+                raise HTTPException(status_code=404, detail="Reservation not found")
+            reservation = await session.scalar(
+                select(Reservation)
+                .where(Reservation.id == reservation_id)
+                .with_for_update()
+            )
+            if reservation is None:
+                raise HTTPException(status_code=404, detail="Reservation not found")
+
+            existing_booking = await session.scalar(
+                select(Booking).where(Booking.reservation_id == reservation_id)
+            )
+            if existing_booking is not None:
+                existing_payment = await session.scalar(
+                    select(Payment).where(Payment.booking_id == existing_booking.id)
+                )
+                if existing_payment is None:
+                    raise HTTPException(
+                        status_code=409, detail="Checkout record is incomplete"
+                    )
+                result = _checkout_response(existing_booking, existing_payment)
+                replayed = True
+            else:
+                now = datetime.now(UTC)
+                if await _expire_if_elapsed(session, reservation, now):
+                    conflict = "Reservation has expired"
+                elif reservation.status == ReservationStatus.EXPIRED.value:
+                    conflict = "Reservation has expired"
+                elif reservation.status == ReservationStatus.CANCELLED.value:
+                    conflict = "Reservation has been cancelled"
+                elif reservation.status == ReservationStatus.CONVERTED.value:
+                    conflict = "Reservation has already been consumed"
+                elif reservation.status != ReservationStatus.ACTIVE.value:
+                    conflict = "Reservation cannot be checked out"
+                else:
+                    event = await session.scalar(
+                        select(Event).where(Event.id == reservation.event_id)
+                    )
+                    if event is None:
+                        raise HTTPException(status_code=404, detail="Event not found")
+                    success = payload.outcome == "success"
+                    booking = Booking(
+                        event_id=reservation.event_id,
+                        seat_id=reservation.seat_id,
+                        reservation_id=reservation.id,
+                        status=(
+                            BookingStatus.CONFIRMED.value
+                            if success
+                            else BookingStatus.CANCELLED.value
+                        ),
+                        amount_paid=event.ticket_price if success else Decimal("0.00"),
+                        currency=event.currency,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(booking)
+                    await session.flush()
+                    payment = Payment(
+                        booking_id=booking.id,
+                        amount=event.ticket_price,
+                        currency=event.currency,
+                        status=(
+                            PaymentStatus.SUCCEEDED.value
+                            if success
+                            else PaymentStatus.FAILED.value
+                        ),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    reservation.status = (
+                        ReservationStatus.CONVERTED.value
+                        if success
+                        else ReservationStatus.CANCELLED.value
+                    )
+                    reservation.updated_at = now
+                    session.add(payment)
+                    await session.flush()
+                    result = _checkout_response(booking, payment)
+    except IntegrityError:
+        # Any failed insert rolls back the reservation transition and its
+        # booking/payment rows together.
+        raise HTTPException(status_code=409, detail="Checkout could not be completed") from None
+
+    if conflict is not None:
+        raise HTTPException(status_code=409, detail=conflict)
+    assert result is not None
+    if replayed:
+        response.status_code = status.HTTP_200_OK
+    return result

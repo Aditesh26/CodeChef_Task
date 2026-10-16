@@ -1,4 +1,4 @@
-"""HTTP endpoints for the temporary reservation lifecycle."""
+# HTTP endpoints for the temporary reservation lifecycle.
 
 from datetime import UTC, datetime, timedelta
 
@@ -106,9 +106,7 @@ async def _lock_reservation_and_seat(
         raise HTTPException(status_code=404, detail="Reservation not found")
 
     reservation = await session.scalar(
-        select(Reservation)
-        .where(Reservation.id == reservation_id)
-        .with_for_update()
+        select(Reservation).where(Reservation.id == reservation_id).with_for_update()
     )
     if reservation is None:
         raise HTTPException(status_code=404, detail="Reservation not found")
@@ -143,7 +141,9 @@ async def create_reservation(
                 )
                 if event_exists is None:
                     raise HTTPException(status_code=404, detail="Event not found")
-                raise HTTPException(status_code=404, detail="Seat not found for this event")
+                raise HTTPException(
+                    status_code=404, detail="Seat not found for this event"
+                )
 
             # This is the first consistent read in the transaction, after any
             # wait for the seat lock, so it observes state committed by the
@@ -152,12 +152,13 @@ async def create_reservation(
             if event is None:
                 raise HTTPException(status_code=404, detail="Event not found")
             if event.status != EventStatus.OPEN.value:
-                raise HTTPException(status_code=409, detail="Event is not open for reservations")
+                raise HTTPException(
+                    status_code=409, detail="Event is not open for reservations"
+                )
 
             now = datetime.now(UTC)
             active_reservation = await session.scalar(
-                select(Reservation)
-                .where(
+                select(Reservation).where(
                     Reservation.event_id == event_id,
                     Reservation.active_seat_id == seat.id,
                 )
@@ -187,7 +188,8 @@ async def create_reservation(
                     status=ReservationStatus.ACTIVE.value,
                     created_at=now,
                     updated_at=now,
-                    expires_at=now + timedelta(seconds=settings.reservation_hold_seconds),
+                    expires_at=now
+                    + timedelta(seconds=settings.reservation_hold_seconds),
                 )
                 session.add(reservation)
                 await session.flush()
@@ -195,7 +197,9 @@ async def create_reservation(
                 response = _reservation_response(reservation)
     except IntegrityError:
         # The context manager has rolled back before this handler is reached.
-        raise HTTPException(status_code=409, detail="Seat is no longer available") from None
+        raise HTTPException(
+            status_code=409, detail="Seat is no longer available"
+        ) from None
 
     # Commit any lazy expiration before reporting a later availability conflict.
     if conflict is not None:
@@ -204,9 +208,7 @@ async def create_reservation(
     return response
 
 
-@router.get(
-    "/api/reservations/{reservation_id}", response_model=ReservationRead
-)
+@router.get("/api/reservations/{reservation_id}", response_model=ReservationRead)
 async def get_reservation(
     reservation_id: int = Path(gt=0),
     session: AsyncSession = Depends(get_db_session),
@@ -221,9 +223,7 @@ async def get_reservation(
         return _reservation_response(reservation)
 
 
-@router.delete(
-    "/api/reservations/{reservation_id}", response_model=ReservationRead
-)
+@router.delete("/api/reservations/{reservation_id}", response_model=ReservationRead)
 async def cancel_reservation(
     reservation_id: int = Path(gt=0),
     session: AsyncSession = Depends(get_db_session),

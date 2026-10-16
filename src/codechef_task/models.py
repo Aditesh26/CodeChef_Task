@@ -171,6 +171,7 @@ class Booking(Base):
             "status IN ('confirmed', 'cancelled')", name="ck_bookings_status"
         ),
         CheckConstraint("amount_paid >= 0", name="ck_bookings_amount_nonnegative"),
+        UniqueConstraint("reservation_id", name="uq_bookings_reservation_id"),
         Index(
             "uq_bookings_confirmed_event_seat",
             "event_id",
@@ -214,6 +215,7 @@ class Payment(Base):
             "status IN ('pending', 'succeeded', 'failed', 'refunded')",
             name="ck_payments_status",
         ),
+        UniqueConstraint("booking_id", name="uq_payments_booking_id"),
         Index("ix_payments_booking_status", "booking_id", "status"),
     )
 

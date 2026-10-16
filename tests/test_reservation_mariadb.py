@@ -9,7 +9,8 @@ from sqlalchemy import delete, func, select, text
 
 from codechef_task.app import app
 from codechef_task.database import SessionLocal, engine
-from codechef_task.models import Booking, Event, EventStatus, Reservation, Seat
+from codechef_task.models import Booking, Event, EventStatus, Payment, Reservation, Seat
+from codechef_task.migrate import apply_checkout_constraints
 from codechef_task.schema import initialize_schema
 
 
@@ -23,6 +24,7 @@ def test_concurrent_reservations_are_safe_on_mariadb() -> None:
             pytest.skip(f"MariaDB unavailable ({type(exc).__name__})")
 
         await initialize_schema(engine)
+        await apply_checkout_constraints(engine)
         async with engine.connect() as connection:
             table_engines = dict(
                 (
@@ -139,6 +141,30 @@ def test_concurrent_reservations_are_safe_on_mariadb() -> None:
                 )
                 assert replacement.status_code == 201
 
+                # Concurrent retries for one reservation serialize on the
+                # seat row and resolve to the same persisted booking/payment.
+                reservation_id = replacement.json()["id"]
+                checkouts = await asyncio.gather(
+                    client.post(
+                        f"/api/reservations/{reservation_id}/checkout",
+                        json={"outcome": "success"},
+                    ),
+                    client.post(
+                        f"/api/reservations/{reservation_id}/checkout",
+                        json={"outcome": "success"},
+                    ),
+                )
+                assert sorted(response.status_code for response in checkouts) == [
+                    200,
+                    201,
+                ]
+                assert checkouts[0].json()["booking_id"] == checkouts[1].json()[
+                    "booking_id"
+                ]
+                assert checkouts[0].json()["payment_id"] == checkouts[1].json()[
+                    "payment_id"
+                ]
+
                 reclaimed = await client.post(
                     f"/api/events/{event_id}/reservations",
                     json={"seat_id": seat_ids[3]},
@@ -184,6 +210,17 @@ def test_concurrent_reservations_are_safe_on_mariadb() -> None:
                     )
                 )
                 assert active_count <= 1
+                booking_count = await session.scalar(
+                    select(func.count(Booking.id)).where(
+                        Booking.reservation_id == reservation_id
+                    )
+                )
+                payment_count = await session.scalar(
+                    select(func.count(Payment.id)).where(
+                        Payment.booking_id == checkouts[0].json()["booking_id"]
+                    )
+                )
+                assert booking_count == payment_count == 1
         finally:
             if event_id is not None:
                 async with SessionLocal.begin() as session:

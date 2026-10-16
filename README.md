@@ -1,88 +1,138 @@
 # The Last Seat
 
-An asynchronous FastAPI backend and initial database schema for the college
-recruitment task.
+The Last Seat is an asynchronous FastAPI backend for a college recruitment
+task. It demonstrates a seat inventory, temporary reservations, and an atomic
+booking plus simulated-payment flow using MariaDB and SQLAlchemy 2.x.
 
-## Prerequisites and setup
+## Architecture
+
+- `src/codechef_task/app.py` creates the FastAPI application and health routes.
+- `reservation_routes.py` handles holds, reservation retrieval, and cancellation.
+- `checkout_routes.py` converts one valid reservation into a booking and
+  simulated payment.
+- `models.py` defines Event, Seat, Reservation, Booking, and Payment.
+- `database.py` configures the async SQLAlchemy engine/session using `asyncmy`.
+- `schema.py`, `migrate.py`, and `seed.py` initialize tables, add checkout
+  uniqueness constraints, and seed demo inventory respectively.
+- Mermaid diagrams: [ERD](docs/ERD.md) and
+  [reservation/booking workflow](docs/Booking-Workflow.md).
+
+MariaDB/InnoDB is the concurrency authority. SQLite is used for fast isolated
+route and constraint tests; it does not reproduce InnoDB row locking.
+
+## Prerequisites
 
 - Python 3.14 or newer
-- [`uv`](https://docs.astral.sh/uv/)
-- MariaDB listening on the configured host and port
+- [uv](https://docs.astral.sh/uv/)
+- MariaDB 13.x for local development, or Docker Desktop with Docker Compose
 
-From the repository root, install runtime and development dependencies:
+## Local setup with uv
+
+Install the locked dependencies:
 
 ```powershell
-uv sync
+uv sync --locked
 ```
 
-Set `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD` in `.env`.
-The defaults for the host and port target local MariaDB at `127.0.0.1:3307`;
-the database named by `DB_NAME` must already exist. `.env` is ignored by Git.
-Set `RESERVATION_HOLD_SECONDS` to a positive number to change the temporary
-hold duration; the default is 300 seconds (5 minutes).
+Create the local environment file from the placeholder template and edit its
+database credentials. PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+For a host-installed MariaDB, `.env` uses `127.0.0.1:3307`. Create the database
+and a least-privilege local user in a MariaDB client, replacing the example
+password before executing:
+
+```sql
+CREATE DATABASE the_last_seat;
+CREATE USER 'lastseat'@'localhost' IDENTIFIED BY 'replace-with-a-local-password';
+GRANT ALL PRIVILEGES ON the_last_seat.* TO 'lastseat'@'localhost';
+```
+
+If the database or user already exists, preserve it and adjust the grants as
+needed; do not drop or recreate an existing database. The application reads
+`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and
+`RESERVATION_HOLD_SECONDS` from environment variables or `.env`. `.env` is
+ignored by Git and excluded from Docker builds. Never put real credentials in
+`.env.example`.
+
+Initialize missing tables and apply the safe, forward-only checkout migration:
+
+```powershell
+uv run --locked python -m codechef_task.migrate
+```
+
+The migration adds unique keys on `bookings.reservation_id` and
+`payments.booking_id`. It checks for duplicates before altering either table
+and stops without deleting data if duplicates exist. It skips keys already
+present. SQLAlchemy `create_all()` creates missing tables but does not evolve
+existing ones; this one-off migration is only for the current milestone. Use a
+versioned migration tool for subsequent schema evolution.
+
+Seed or complete the demo event inventory:
+
+```powershell
+uv run --locked python -m codechef_task.seed
+```
+
+The seed operation is repeatable and creates exactly seat numbers 1–500 for
+`the-last-seat-demo` if that event has no out-of-range seats. It does not
+duplicate existing seats or delete data.
 
 ## Run the API
 
 ```powershell
-uv run uvicorn codechef_task.app:app --reload
+uv run --locked uvicorn codechef_task.app:app --reload
 ```
 
-The API is available at `http://127.0.0.1:8000`. `/health` checks the API
-process, and `/health/db` runs a simple database query.
+The API listens at `http://127.0.0.1:8000`. Interactive API docs are at
+`/docs`.
 
-## Initial schema and demo inventory
+## API endpoints
 
-The schema has five tables:
+### `GET /health`
 
-- `events` stores an event's slug, status, schedule, ticket price, and currency.
-- `seats` stores numbered seats for an event. A unique constraint on
-  `(event_id, seat_number)` prevents duplicate seat numbers within one event.
-- `reservations` stores temporary seat holds, their expiry timestamp, and an
-  explicit status: `active`, `converted`, `expired`, or `cancelled`.
-- `bookings` stores confirmed or cancelled booking records and the amount paid.
-- `payments` stores individual payment attempts separately from bookings, with
-  their own amount, provider reference, and status.
+Checks that the API process responds:
 
-Amounts use fixed precision `NUMERIC(10, 2)`, not floating point. Timestamps
-are stored as timezone-aware SQLAlchemy datetimes; use UTC when writing times.
-Foreign keys ensure each reservation and booking refers to a seat in the same
-event.
-
-MariaDB enforces the confirmed-seat rule with the generated `confirmed_seat_id`
-column on `bookings` and the unique index on `(event_id, confirmed_seat_id)`.
-The generated column contains the seat ID only while a booking is confirmed;
-otherwise it is `NULL`. MariaDB permits multiple `NULL` values in a unique
-index, while rejecting a second confirmed row for the same event and seat.
-An equivalent generated column and index enforce at most one active reservation
-for a seat. An active reservation is transitioned to `expired` by reservation
-requests once its expiry time is reached.
-
-Initialize missing tables and seed the demo event with seats 1 through 500:
-
-```powershell
-uv run python -m codechef_task.seed
+```http
+GET /health
 ```
 
-The initializer uses SQLAlchemy `create_all()`, which creates missing tables
-and does not drop or recreate existing tables or the database. Running the
-seed command again fills in missing seat numbers without duplicating existing
-ones. If the event already has seats outside 1–500, the seed command stops
-instead of deleting them. `create_all()` is suitable for this initial schema;
-use a migration tool before evolving a deployed schema.
+```json
+{"status":"healthy"}
+```
 
-## Reservation API
+### `GET /health/db`
 
-Create a hold for a seat in an open event:
+Runs `SELECT 1`. On success:
+
+```json
+{"status":"healthy","database":"available"}
+```
+
+Request: `GET /health/db`. When the database is unavailable, it returns HTTP
+503 with this generic response:
+
+```json
+{"detail":{"status":"unhealthy","database":"unavailable"}}
+```
+
+Credentials and internal exception details are not returned.
+
+### `POST /api/events/{event_id}/reservations`
+
+Creates a temporary hold for an available seat in an open event:
 
 ```http
 POST /api/events/1/reservations
 Content-Type: application/json
 
-{"seat_id": 42}
+{"seat_id":42}
 ```
 
-The response is `201 Created` and includes the reservation identifier and UTC
-timestamps:
+HTTP 201 response:
 
 ```json
 {
@@ -95,41 +145,137 @@ timestamps:
 }
 ```
 
-Retrieve a reservation with `GET /api/reservations/17`; cancel an active one
-with `DELETE /api/reservations/17`. Both return the same reservation shape.
-Unknown events or seats return `404`. Closed/cancelled events, already-held or
-booked seats, and attempts to cancel a terminal reservation return `409`.
+Unknown event/seat returns 404. Closed events or unavailable seats return 409.
 
-The lifecycle is `active` to one of `cancelled`, `expired`, or (in a future
-booking flow) `converted`. Terminal states are never changed back to active.
-Expiration is lazy: create requests check the seat's active hold, and retrieve
-requests refresh that reservation's status. If `expires_at <=` the current UTC
-time, they persist `expired`; a past timestamp by itself does not release the
-seat. No worker is required, but an expired hold on an untouched seat remains
-stored as active until a request processes it.
+### `GET /api/reservations/{reservation_id}`
 
-### Concurrency behavior
+Example request: `GET /api/reservations/17`. Returns HTTP 200 and the
+reservation shape shown in the creation example, lazily persisting `expired`
+when the hold deadline has passed. Unknown reservation returns 404.
 
-Create, retrieve, and cancel operations lock the concrete seat row with
-`SELECT ... FOR UPDATE` before changing its hold. Two create requests for the
-same seat therefore serialize on the same InnoDB row; the second request sees
-the first committed active hold and receives `409`. The existing unique index
-on `(event_id, active_seat_id)` remains a database-level backstop if another
-writer bypasses this code. Expiration changes the reservation status and flushes
-that change before a new hold is inserted, clearing the generated active-seat
-key in the same transaction. Confirmed bookings are checked independently and
-remain protected by the unique confirmed-booking index.
+### `DELETE /api/reservations/{reservation_id}`
 
-The MariaDB integration test exercises simultaneous requests for the same
-seat and for different seats. SQLite tests cover the lifecycle and response
-rules, but SQLite does not validate InnoDB row-lock semantics. This milestone
-does not include authentication or reservation ownership checks, booking
-creation, an expiration worker, or load testing; it makes no 10,000-user
-capacity claim. Event status changes and any future booking-creation flow must
-also coordinate with the seat-lock protocol.
+Example request: `DELETE /api/reservations/17`. Cancels an active hold and
+returns HTTP 200 with the updated reservation shape shown above (with `status`
+set to `cancelled`). A terminal or expired hold returns 409. Cancellation does
+not delete reservation history.
 
-## Run tests
+### `POST /api/reservations/{reservation_id}/checkout`
+
+Simulates checkout for an active, unexpired reservation. The request chooses
+only a simulated outcome; price and currency are loaded from the event:
+
+```http
+POST /api/reservations/17/checkout
+Content-Type: application/json
+
+{"outcome":"success"}
+```
+
+Allowed outcomes are `success` and `failure`. Example HTTP 201 response:
+
+```json
+{
+  "booking_id": 21,
+  "reservation_id": 17,
+  "booking_status": "confirmed",
+  "payment_id": 33,
+  "payment_status": "succeeded",
+  "amount": "25.00",
+  "currency": "USD"
+}
+```
+
+Repeating checkout returns the original result with HTTP 200. A request for an
+expired or cancelled reservation returns 409; not-found reservation returns
+404. Database write errors return a generic 409 without exposing internals.
+
+## Schema, lifecycle, and concurrency
+
+The five models are shown in [docs/ERD.md](docs/ERD.md); the state and lock
+flow is shown in [docs/Booking-Workflow.md](docs/Booking-Workflow.md). Money
+uses `NUMERIC(10, 2)`. Times use UTC. Composite seat foreign keys ensure a
+reservation or booking points to a seat belonging to the same event.
+
+Reservation states are `active`, `converted`, `expired`, and `cancelled`.
+Checkout success changes `active → converted`; failure changes `active →
+cancelled`. Failed payment keeps a cancelled booking and failed payment as
+history while releasing inventory. Terminal reservations are not reactivated.
+
+Expiry is lazy: an API operation processes an elapsed hold; there is no expiry
+worker. Until a request touches an expired hold, its stored status can remain
+`active`, but reservation/checkout paths compare `expires_at` before proceeding.
+
+Every reservation and checkout mutation locks the concrete seat row with
+`SELECT ... FOR UPDATE`, then locks the reservation. The lock serializes
+writers for that seat in InnoDB. Checkout writes booking, payment, and
+reservation state inside one transaction, so an error rolls back all of them.
+Database unique constraints back up application checks:
+
+- `(event_id, active_seat_id)` permits at most one active reservation per seat.
+- `(event_id, confirmed_seat_id)` permits at most one confirmed booking per
+  seat. The generated seat key is NULL for cancelled historical bookings.
+- Unique `bookings.reservation_id` permits one booking per reservation.
+- Unique `payments.booking_id` permits one payment row per booking.
+- `(event_id, seat_number)` prevents repeated seat numbers within an event.
+
+The checkout idempotency scope is the reservation: the first outcome persists,
+and repeated or concurrent requests return the stored payment and booking.
+There is one attempt per reservation; a failed payment is terminal and a retry
+requires a new reservation. This is a deterministic simulator, not payment
+provider integration. It has no delayed outcome or external charge behavior.
+
+The MariaDB integration test exercises same-seat reservation and duplicate
+checkout concurrency. SQLite tests validate API and transaction behavior but
+cannot establish InnoDB locking behavior. Locks coordinate only code paths
+that follow the same seat-first protocol. There is no authentication or
+reservation ownership check, so this API is not ready for public use. Event
+administration, refunds, provider retries, background expiry, and load testing
+are not implemented. No claim of 10,000 concurrent users is made. Scaling
+beyond a single app/database setup would require measured load tests, database
+pool tuning, and likely horizontally scaled API workers; a shared database
+constraint and row-lock design remains necessary across workers.
+
+## Docker Compose
+
+Docker Compose starts the API and MariaDB. The database has a persistent named
+volume. The API connects to the service name `db` on container port 3306. Its
+host-published port defaults to 3308 to avoid colliding with the existing local
+MariaDB on 3307.
 
 ```powershell
-uv run pytest
+Copy-Item .env.example .env
+# Edit .env and replace all placeholder credentials.
+docker compose up --build -d
+docker compose ps
 ```
+
+Initialize schema and apply the checkout migration, then seed the demo event:
+
+```powershell
+docker compose exec api python -m codechef_task.migrate
+docker compose exec api python -m codechef_task.seed
+```
+
+Check `http://127.0.0.1:8000/health` and `/health/db`. The database can be
+reached from the host on `127.0.0.1:3308` by default; containers use `db:3306`.
+To stop the services while preserving the named database volume:
+
+```powershell
+docker compose down
+```
+
+Do not use `docker compose down -v` if you need to keep the container database.
+The MariaDB image initializes credentials/database only for a new empty data
+volume; changing `.env` later does not rewrite existing database users.
+
+## Tests
+
+Run the entire suite:
+
+```powershell
+uv run --locked --cache-dir .uv-cache pytest -q -p no:cacheprovider
+```
+
+SQLite-based tests need no MariaDB. The MariaDB concurrency test uses the
+configured database when available and skips if the service cannot be reached.
