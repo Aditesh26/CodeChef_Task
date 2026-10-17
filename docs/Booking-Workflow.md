@@ -32,15 +32,36 @@ flowchart TD
     Z --> ZA[Reservation becomes converted]
     Y -- Failure --> ZB[Create cancelled historical booking and failed payment]
     ZB --> ZC[Reservation becomes cancelled; seat is reusable]
-    ZA --> ZD[Commit all checkout writes together]
-    ZC --> ZD
+    Y -- Delayed --> ZD[Create pending booking and payment; keep hold active]
+    ZD --> ZE[Commit pending checkout]
+    ZE --> ZF[Client later requests payment settlement]
+    ZF --> ZG[Lock seat, reservation, booking, and payment]
+    ZG --> ZH{Hold still active and unexpired?}
+    ZH -- No --> ZI[Fail payment and cancel booking; seat reusable]
+    ZH -- Yes, success --> ZJ[Confirm booking; succeed payment; convert hold]
+    ZH -- Yes, failure --> ZK[Cancel booking and hold; fail payment; seat reusable]
+    ZA --> ZD2[Commit checkout writes together]
+    ZC --> ZD2
+    ZJ --> ZD2
+    ZI --> ZD2
+    ZK --> ZD2
+    ZD2 --> ZL[Commit state transition atomically]
+    ZL --> ZM[Confirmed booking may later be cancelled]
+    ZM --> ZN[Preserve booking/payment history; free seat]
 
     J --> AA[New reservation may reuse seat]
     N --> AA
     ZC --> AA
+    ZI --> AA
+    ZK --> AA
+    ZN --> AA
 ```
 
 Every mutating reservation/checkout path locks the concrete seat before the
-reservation row and uses a database transaction. A database error rolls back
-the booking, payment, and reservation transition together. Expiry is lazy: no
-background job currently expires untouched holds.
+reservation row and uses a database transaction. Settlement also locks the
+booking and payment before updating them. A database error rolls back the
+booking, payment, and reservation transition together. Delayed payment is
+settled by an explicit later API request; no sleeping request or background
+payment task is used. Expiry is lazy: no background job currently expires
+untouched holds. Cancelling a confirmed booking preserves the succeeded
+payment record and does not issue a refund.

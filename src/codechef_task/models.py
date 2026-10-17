@@ -42,6 +42,7 @@ class ReservationStatus(StrEnum):
 
 
 class BookingStatus(StrEnum):
+    PENDING = "pending"
     CONFIRMED = "confirmed"
     CANCELLED = "cancelled"
 
@@ -168,7 +169,8 @@ class Booking(Base):
             ondelete="SET NULL",
         ),
         CheckConstraint(
-            "status IN ('confirmed', 'cancelled')", name="ck_bookings_status"
+            "status IN ('pending', 'confirmed', 'cancelled')",
+            name="ck_bookings_status",
         ),
         CheckConstraint("amount_paid >= 0", name="ck_bookings_amount_nonnegative"),
         UniqueConstraint("reservation_id", name="uq_bookings_reservation_id"),

@@ -54,7 +54,7 @@ def test_concurrent_reservations_are_safe_on_mariadb() -> None:
                 session.add(event)
                 await session.flush()
                 event_id = event.id
-                seats = [Seat(event_id=event.id, seat_number=n) for n in range(1, 8)]
+                seats = [Seat(event_id=event.id, seat_number=n) for n in range(1, 9)]
                 session.add_all(seats)
                 await session.flush()
                 now = datetime.now(UTC)
@@ -165,6 +165,28 @@ def test_concurrent_reservations_are_safe_on_mariadb() -> None:
                     "payment_id"
                 ]
 
+                delayed_hold = await client.post(
+                    f"/api/events/{event_id}/reservations",
+                    json={"seat_id": seat_ids[7]},
+                )
+                delayed_checkout = await client.post(
+                    f"/api/reservations/{delayed_hold.json()['id']}/checkout",
+                    json={"outcome": "delayed"},
+                )
+                payment_id = delayed_checkout.json()["payment_id"]
+                settlements = await asyncio.gather(
+                    client.post(
+                        f"/api/payments/{payment_id}/settle",
+                        json={"outcome": "success"},
+                    ),
+                    client.post(
+                        f"/api/payments/{payment_id}/settle",
+                        json={"outcome": "success"},
+                    ),
+                )
+                assert [response.status_code for response in settlements] == [200, 200]
+                assert settlements[0].json() == settlements[1].json()
+
                 reclaimed = await client.post(
                     f"/api/events/{event_id}/reservations",
                     json={"seat_id": seat_ids[3]},
@@ -221,6 +243,15 @@ def test_concurrent_reservations_are_safe_on_mariadb() -> None:
                     )
                 )
                 assert booking_count == payment_count == 1
+                delayed_booking_count = await session.scalar(
+                    select(func.count(Booking.id)).where(
+                        Booking.reservation_id == delayed_hold.json()["id"]
+                    )
+                )
+                delayed_payment_count = await session.scalar(
+                    select(func.count(Payment.id)).where(Payment.id == payment_id)
+                )
+                assert delayed_booking_count == delayed_payment_count == 1
         finally:
             if event_id is not None:
                 async with SessionLocal.begin() as session:

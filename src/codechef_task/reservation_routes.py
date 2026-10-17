@@ -15,6 +15,8 @@ from codechef_task.models import (
     BookingStatus,
     Event,
     EventStatus,
+    Payment,
+    PaymentStatus,
     Reservation,
     ReservationStatus,
     Seat,
@@ -66,9 +68,34 @@ async def _expire_if_elapsed(
     ):
         reservation.status = ReservationStatus.EXPIRED.value
         reservation.updated_at = now
+        await _fail_pending_checkout(session, reservation, now)
         await session.flush()
         return True
     return False
+
+
+async def _fail_pending_checkout(
+    session: AsyncSession, reservation: Reservation, now: datetime
+) -> None:
+    """Fail delayed payment if its active reservation is cancelled or expires."""
+    pending = (
+        await session.execute(
+            select(Booking, Payment)
+            .join(Payment, Payment.booking_id == Booking.id)
+            .where(
+                Booking.reservation_id == reservation.id,
+                Payment.status == PaymentStatus.PENDING.value,
+            )
+            .with_for_update()
+        )
+    ).one_or_none()
+    if pending is None:
+        return
+    booking, payment = pending
+    booking.status = BookingStatus.CANCELLED.value
+    booking.updated_at = now
+    payment.status = PaymentStatus.FAILED.value
+    payment.updated_at = now
 
 
 async def _read_reservation_location(
@@ -245,6 +272,7 @@ async def cancel_reservation(
         else:
             reservation.status = ReservationStatus.CANCELLED.value
             reservation.updated_at = now
+            await _fail_pending_checkout(session, reservation, now)
             await session.flush()
             response = _reservation_response(reservation)
 

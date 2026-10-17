@@ -1,4 +1,4 @@
-"""Apply the small, non-destructive Milestone 4 uniqueness migration."""
+"""Apply small, forward-only schema updates without dropping existing data."""
 
 import asyncio
 
@@ -15,7 +15,7 @@ _UNIQUE_KEYS = (
 
 
 async def apply_checkout_constraints(target_engine: AsyncEngine = engine) -> None:
-    """Add unique keys only when absent; refuse to hide existing duplicates."""
+    """Add checkout keys and allow pending bookings in the status check."""
     async with target_engine.begin() as connection:
         for table, column, constraint in _UNIQUE_KEYS:
             index_rows = (
@@ -58,6 +58,33 @@ async def apply_checkout_constraints(target_engine: AsyncEngine = engine) -> Non
                 text(
                     f"ALTER TABLE `{table}` ADD CONSTRAINT `{constraint}` "
                     f"UNIQUE (`{column}`)"
+                )
+            )
+
+        current_check = (
+            await connection.execute(
+                text(
+                    "SELECT CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS "
+                    "WHERE CONSTRAINT_SCHEMA = DATABASE() "
+                    "AND TABLE_NAME = 'bookings' "
+                    "AND CONSTRAINT_NAME = 'ck_bookings_status'"
+                )
+            )
+        ).scalar_one_or_none()
+        if current_check is None:
+            await connection.execute(
+                text(
+                    "ALTER TABLE bookings ADD CONSTRAINT ck_bookings_status "
+                    "CHECK (status IN ('pending', 'confirmed', 'cancelled'))"
+                )
+            )
+        elif "pending" not in current_check.lower():
+            await connection.execute(
+                text(
+                    "ALTER TABLE bookings "
+                    "DROP CONSTRAINT ck_bookings_status, "
+                    "ADD CONSTRAINT ck_bookings_status "
+                    "CHECK (status IN ('pending', 'confirmed', 'cancelled'))"
                 )
             )
 

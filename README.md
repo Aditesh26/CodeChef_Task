@@ -8,14 +8,17 @@ booking plus simulated-payment flow using MariaDB and SQLAlchemy 2.x.
 
 - `src/codechef_task/app.py` creates the FastAPI application and health routes.
 - `reservation_routes.py` handles holds, reservation retrieval, and cancellation.
+- `inventory_routes.py` lists seat availability, event booking history, and
+  confirmed-booking cancellation.
 - `checkout_routes.py` converts one valid reservation into a booking and
-  simulated payment.
+  simulated payment, including delayed settlement.
 - `models.py` defines Event, Seat, Reservation, Booking, and Payment.
 - `database.py` configures the async SQLAlchemy engine/session using `asyncmy`.
 - `schema.py`, `migrate.py`, and `seed.py` initialize tables, add checkout
   uniqueness constraints, and seed demo inventory respectively.
 - Mermaid diagrams: [ERD](docs/ERD.md) and
   [reservation/booking workflow](docs/Booking-Workflow.md).
+- Requirement-by-requirement review: [functional audit](docs/functional-audit.md).
 
 MariaDB/InnoDB is the concurrency authority. SQLite is used for fast isolated
 route and constraint tests; it does not reproduce InnoDB row locking.
@@ -65,10 +68,11 @@ uv run --locked python -m codechef_task.migrate
 ```
 
 The migration adds unique keys on `bookings.reservation_id` and
-`payments.booking_id`. It checks for duplicates before altering either table
-and stops without deleting data if duplicates exist. It skips keys already
-present. SQLAlchemy `create_all()` creates missing tables but does not evolve
-existing ones; this one-off migration is only for the current milestone. Use a
+`payments.booking_id`, and updates the booking status check to allow `pending`
+delayed bookings. It checks for duplicates before adding keys; it changes no
+booking rows and never drops tables or data. Existing confirmed/cancelled rows
+remain valid. SQLAlchemy `create_all()` creates missing tables but does not
+evolve existing ones; this small migration is for the current milestone. Use a
 versioned migration tool for subsequent schema evolution.
 
 Seed or complete the demo event inventory:
@@ -147,6 +151,27 @@ HTTP 201 response:
 
 Unknown event/seat returns 404. Closed events or unavailable seats return 409.
 
+### `GET /api/events/{event_id}/seats`
+
+Lists seats in number order. Example request: `GET /api/events/1/seats`.
+Example response:
+
+```json
+{
+  "event_id": 1,
+  "seats": [
+    {"seat_id": 12, "seat_number": 1, "status": "available"},
+    {"seat_id": 13, "seat_number": 2, "status": "reserved"},
+    {"seat_id": 14, "seat_number": 3, "status": "booked"}
+  ]
+}
+```
+
+Statuses are `available`, `reserved`, or `booked`. The listing processes
+elapsed active holds with the same locking and lazy-expiry behavior used by
+reservation operations. It is a point-in-time view; a subsequent reservation
+request can still lose a race and return 409. Unknown event returns 404.
+
 ### `GET /api/reservations/{reservation_id}`
 
 Example request: `GET /api/reservations/17`. Returns HTTP 200 and the
@@ -172,7 +197,8 @@ Content-Type: application/json
 {"outcome":"success"}
 ```
 
-Allowed outcomes are `success` and `failure`. Example HTTP 201 response:
+Immediate outcomes are `success` and `failure`. Example HTTP 201 response for
+success:
 
 ```json
 {
@@ -186,9 +212,68 @@ Allowed outcomes are `success` and `failure`. Example HTTP 201 response:
 }
 ```
 
-Repeating checkout returns the original result with HTTP 200. A request for an
-expired or cancelled reservation returns 409; not-found reservation returns
-404. Database write errors return a generic 409 without exposing internals.
+For an asynchronous simulated response, send `{"outcome":"delayed"}`. Checkout
+creates a `pending` booking and payment and leaves the reservation active. It
+returns HTTP 201 in the same response shape, with both statuses set to
+`pending`. Later, explicitly settle it:
+
+```http
+POST /api/payments/33/settle
+Content-Type: application/json
+
+{"outcome":"success"}
+```
+
+The settlement response is HTTP 200 with final booking/payment statuses. Use
+`failure` to release the seat instead. Settlement is an explicit later
+request, not a timer or background worker. If the reservation is cancelled or
+expires first, its pending payment is changed to failed and its booking to
+cancelled; it cannot later confirm. Repeated checkout or settlement returns
+the stored result even if the retry supplies a different outcome. Expired or
+cancelled reservations without an existing checkout return 409; unknown IDs
+return 404. Database write errors return a generic 409.
+
+### `GET /api/events/{event_id}/bookings`
+
+Returns event booking history, newest first, including cancelled and pending
+records and optional payment details. Example request:
+`GET /api/events/1/bookings?limit=100&offset=0`.
+
+```json
+{
+  "event_id": 1,
+  "items": [{
+    "id": 21,
+    "event_id": 1,
+    "seat_id": 14,
+    "reservation_id": 17,
+    "status": "confirmed",
+    "amount_paid": "25.00",
+    "currency": "USD",
+    "created_at": "2026-10-16T12:00:00Z",
+    "payment": {
+      "id": 33,
+      "status": "succeeded",
+      "amount": "25.00",
+      "currency": "USD",
+      "created_at": "2026-10-16T12:00:00Z"
+    }
+  }]
+}
+```
+
+`limit` is 1–500 (default 100); `offset` defaults to 0. Unknown event returns
+404. This is event-wide history; no authentication or user ownership filtering
+exists.
+
+### `POST /api/bookings/{booking_id}/cancel`
+
+Cancels a confirmed booking while preserving its row. Example:
+`POST /api/bookings/21/cancel`. The response is the booking-history item above
+with `status: "cancelled"`; the seat becomes available for a new reservation.
+Repeated cancellation returns the same record. The succeeded payment remains
+in history: cancellation does not issue a refund. Only confirmed bookings can
+be cancelled through this endpoint.
 
 ## Schema, lifecycle, and concurrency
 
@@ -201,6 +286,11 @@ Reservation states are `active`, `converted`, `expired`, and `cancelled`.
 Checkout success changes `active → converted`; failure changes `active →
 cancelled`. Failed payment keeps a cancelled booking and failed payment as
 history while releasing inventory. Terminal reservations are not reactivated.
+Booking states are `pending`, `confirmed`, and `cancelled`. A delayed checkout
+persists pending booking/payment records while retaining its active hold. The
+explicit settlement endpoint either confirms/converts/succeeds or
+cancels/cancels/fails. Expiry or hold cancellation first also fails a pending
+attempt.
 
 Expiry is lazy: an API operation processes an elapsed hold; there is no expiry
 worker. Until a request touches an expired hold, its stored status can remain
@@ -214,7 +304,8 @@ Database unique constraints back up application checks:
 
 - `(event_id, active_seat_id)` permits at most one active reservation per seat.
 - `(event_id, confirmed_seat_id)` permits at most one confirmed booking per
-  seat. The generated seat key is NULL for cancelled historical bookings.
+  seat. The generated seat key is NULL for pending and cancelled historical
+  rows; pending inventory remains protected by its active reservation.
 - Unique `bookings.reservation_id` permits one booking per reservation.
 - Unique `payments.booking_id` permits one payment row per booking.
 - `(event_id, seat_number)` prevents repeated seat numbers within an event.
@@ -222,19 +313,23 @@ Database unique constraints back up application checks:
 The checkout idempotency scope is the reservation: the first outcome persists,
 and repeated or concurrent requests return the stored payment and booking.
 There is one attempt per reservation; a failed payment is terminal and a retry
-requires a new reservation. This is a deterministic simulator, not payment
-provider integration. It has no delayed outcome or external charge behavior.
+requires a new reservation. A delayed outcome is resolved by an explicit later
+settlement request; it does not sleep in a request or create an untracked task.
+This is a deterministic simulator, not payment provider integration, and it
+does not create an external charge.
 
-The MariaDB integration test exercises same-seat reservation and duplicate
-checkout concurrency. SQLite tests validate API and transaction behavior but
+The MariaDB integration test exercises same-seat reservation, duplicate
+checkout, and delayed-settlement concurrency. SQLite tests validate API and transaction behavior but
 cannot establish InnoDB locking behavior. Locks coordinate only code paths
 that follow the same seat-first protocol. There is no authentication or
 reservation ownership check, so this API is not ready for public use. Event
-administration, refunds, provider retries, background expiry, and load testing
-are not implemented. No claim of 10,000 concurrent users is made. Scaling
-beyond a single app/database setup would require measured load tests, database
-pool tuning, and likely horizontally scaled API workers; a shared database
-constraint and row-lock design remains necessary across workers.
+administration, refunds, provider retries, and background expiry are not
+implemented. A small reproducible load smoke test is documented in
+[docs/load-test-results.md](docs/load-test-results.md); it is not a capacity
+benchmark. No claim of 10,000 concurrent users is made. Scaling beyond a single
+app/database setup would require representative load tests, database pool
+tuning, and likely horizontally scaled API workers; shared database
+constraints and row locks remain necessary across workers.
 
 ## Docker Compose
 
@@ -279,3 +374,21 @@ uv run --locked --cache-dir .uv-cache pytest -q -p no:cacheprovider
 
 SQLite-based tests need no MariaDB. The MariaDB concurrency test uses the
 configured database when available and skips if the service cannot be reached.
+
+## Basic load test
+
+Start the API in one terminal, then run the repeatable contention test in
+another:
+
+```powershell
+uv run --locked uvicorn codechef_task.app:app --host 127.0.0.1 --port 8000
+uv run --locked python scripts/load_test.py --requests 100 --seats 10 --checkout-retries 3 --concurrency 50
+```
+
+The script requires the configured MariaDB and initialized schema. Each run
+creates a uniquely named open event and its own small seat inventory, competes
+reservation requests for those seats, then makes concurrent retries for each
+successful checkout. It queries database invariants before deleting only that
+run's event; event cascades remove its test rows. `--keep-data` retains the
+isolated event for inspection. Results and limitations from the measured run
+are recorded in [docs/load-test-results.md](docs/load-test-results.md).

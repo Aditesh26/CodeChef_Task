@@ -23,6 +23,7 @@ from codechef_task.models import (
 )
 from codechef_task.reservation_routes import (
     _expire_if_elapsed,
+    _fail_pending_checkout,
     _read_reservation_location,
 )
 
@@ -31,6 +32,12 @@ router = APIRouter()
 
 class CheckoutRequest(BaseModel):
     """Select a simulated gateway result; price always comes from the event."""
+
+    outcome: Literal["success", "failure", "delayed"]
+
+
+class SettlementRequest(BaseModel):
+    """Supply the simulated outcome when a pending payment is settled."""
 
     outcome: Literal["success", "failure"]
 
@@ -95,6 +102,8 @@ async def checkout_reservation(
             if reservation is None:
                 raise HTTPException(status_code=404, detail="Reservation not found")
 
+            now = datetime.now(UTC)
+            expired_now = await _expire_if_elapsed(session, reservation, now)
             existing_booking = await session.scalar(
                 select(Booking).where(Booking.reservation_id == reservation_id)
             )
@@ -109,8 +118,7 @@ async def checkout_reservation(
                 result = _checkout_response(existing_booking, existing_payment)
                 replayed = True
             else:
-                now = datetime.now(UTC)
-                if await _expire_if_elapsed(session, reservation, now):
+                if expired_now:
                     conflict = "Reservation has expired"
                 elif reservation.status == ReservationStatus.EXPIRED.value:
                     conflict = "Reservation has expired"
@@ -127,6 +135,7 @@ async def checkout_reservation(
                     if event is None:
                         raise HTTPException(status_code=404, detail="Event not found")
                     success = payload.outcome == "success"
+                    delayed = payload.outcome == "delayed"
                     booking = Booking(
                         event_id=reservation.event_id,
                         seat_id=reservation.seat_id,
@@ -134,6 +143,8 @@ async def checkout_reservation(
                         status=(
                             BookingStatus.CONFIRMED.value
                             if success
+                            else BookingStatus.PENDING.value
+                            if delayed
                             else BookingStatus.CANCELLED.value
                         ),
                         amount_paid=event.ticket_price if success else Decimal("0.00"),
@@ -150,17 +161,20 @@ async def checkout_reservation(
                         status=(
                             PaymentStatus.SUCCEEDED.value
                             if success
+                            else PaymentStatus.PENDING.value
+                            if delayed
                             else PaymentStatus.FAILED.value
                         ),
                         created_at=now,
                         updated_at=now,
                     )
-                    reservation.status = (
-                        ReservationStatus.CONVERTED.value
-                        if success
-                        else ReservationStatus.CANCELLED.value
-                    )
-                    reservation.updated_at = now
+                    if not delayed:
+                        reservation.status = (
+                            ReservationStatus.CONVERTED.value
+                            if success
+                            else ReservationStatus.CANCELLED.value
+                        )
+                        reservation.updated_at = now
                     session.add(payment)
                     await session.flush()
                     result = _checkout_response(booking, payment)
@@ -174,4 +188,97 @@ async def checkout_reservation(
     assert result is not None
     if replayed:
         response.status_code = status.HTTP_200_OK
+    return result
+
+
+@router.post(
+    "/api/payments/{payment_id}/settle", response_model=CheckoutRead
+)
+async def settle_delayed_payment(
+    payload: SettlementRequest,
+    payment_id: int = Path(gt=0),
+    session: AsyncSession = Depends(get_db_session),
+) -> CheckoutRead:
+    """Settle a persisted pending payment without a worker or sleeping request."""
+    location = (
+        await session.execute(
+            select(
+                Booking.id,
+                Booking.event_id,
+                Booking.seat_id,
+                Booking.reservation_id,
+            )
+            .join(Payment, Payment.booking_id == Booking.id)
+            .where(Payment.id == payment_id)
+        )
+    ).one_or_none()
+    if location is None:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    booking_id, event_id, seat_id, reservation_id = location
+    await session.commit()
+    if reservation_id is None:
+        raise HTTPException(status_code=409, detail="Payment has no reservation")
+
+    result: CheckoutRead | None = None
+    conflict: str | None = None
+    try:
+        async with session.begin():
+            seat = await session.scalar(
+                select(Seat)
+                .where(Seat.event_id == event_id, Seat.id == seat_id)
+                .with_for_update()
+            )
+            if seat is None:
+                raise HTTPException(status_code=404, detail="Payment not found")
+            reservation = await session.scalar(
+                select(Reservation)
+                .where(Reservation.id == reservation_id)
+                .with_for_update()
+            )
+            if reservation is None:
+                raise HTTPException(status_code=404, detail="Reservation not found")
+
+            expired_now = await _expire_if_elapsed(
+                session, reservation, datetime.now(UTC)
+            )
+            booking = await session.scalar(
+                select(Booking).where(Booking.id == booking_id).with_for_update()
+            )
+            payment = await session.scalar(
+                select(Payment).where(Payment.id == payment_id).with_for_update()
+            )
+            if booking is None or payment is None:
+                raise HTTPException(status_code=404, detail="Payment not found")
+
+            if payment.status != PaymentStatus.PENDING.value:
+                result = _checkout_response(booking, payment)
+            elif expired_now or reservation.status == ReservationStatus.EXPIRED.value:
+                conflict = "Reservation expired before payment settlement"
+            elif reservation.status != ReservationStatus.ACTIVE.value:
+                await _fail_pending_checkout(session, reservation, datetime.now(UTC))
+                conflict = "Reservation is no longer active"
+            else:
+                now = datetime.now(UTC)
+                if payload.outcome == "success":
+                    booking.status = BookingStatus.CONFIRMED.value
+                    booking.amount_paid = payment.amount
+                    reservation.status = ReservationStatus.CONVERTED.value
+                    payment.status = PaymentStatus.SUCCEEDED.value
+                else:
+                    booking.status = BookingStatus.CANCELLED.value
+                    reservation.status = ReservationStatus.CANCELLED.value
+                    payment.status = PaymentStatus.FAILED.value
+                booking.updated_at = now
+                reservation.updated_at = now
+                payment.updated_at = now
+                await session.flush()
+                result = _checkout_response(booking, payment)
+    except IntegrityError:
+        raise HTTPException(
+            status_code=409, detail="Payment settlement could not be completed"
+        ) from None
+
+    if conflict is not None:
+        raise HTTPException(status_code=409, detail=conflict)
+    assert result is not None
     return result

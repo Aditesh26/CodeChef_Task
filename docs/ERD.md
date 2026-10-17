@@ -44,7 +44,7 @@ erDiagram
         int event_id FK
         int seat_id FK
         int reservation_id FK "nullable, unique"
-        string status
+        string status "pending, confirmed, cancelled"
         decimal amount_paid
         char currency
         int confirmed_seat_id "generated while confirmed"
@@ -68,4 +68,6 @@ indexes with `event_id`. The nullable generated key lets historical terminal
 rows coexist while preventing two active holds or two confirmed bookings for
 the same event seat. A unique nullable `Booking.reservation_id` links at most
 one booking to a reservation; a unique `Payment.booking_id` allows at most one
-payment record for a booking.
+payment record for a booking. Pending bookings do not set the confirmed-seat
+key; their active reservation protects that seat until settlement, cancellation,
+or expiry.
